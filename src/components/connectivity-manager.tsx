@@ -7,7 +7,6 @@ import { toast } from "sonner";
 
 let syncInFlight = false;
 
-/** Pushes queued answers to the cloud, then marks local quiz results as synced. */
 export async function syncOfflineResults(): Promise<number> {
   if (syncInFlight || !navigator.onLine) return 0;
   syncInFlight = true;
@@ -17,11 +16,20 @@ export async function syncOfflineResults(): Promise<number> {
     let failed = false;
     for (const event of events) {
       const { error } = await supabase.from("study_sessions").insert({
-        id: event.id, user_id: event.userId, deck_id: event.deckId, mode: event.mode,
-        score: event.score, total: event.total, completed_at: event.completedAt,
+        id: event.id,
+        user_id: event.userId,
+        deck_id: event.deckId,
+        mode: event.mode,
+        score: event.score,
+        total: event.total,
+        completed_at: event.completedAt,
       });
-      if (!error || error.code === "23505") { await removeStudyEvent(event.id); synced++; }
-      else failed = true;
+      if (!error || error.code === "23505") {
+        await removeStudyEvent(event.id);
+        synced++;
+      } else {
+        failed = true;
+      }
     }
     if (!failed) {
       const attempts = await listQuizAttempts();
@@ -46,7 +54,7 @@ export function ConnectivityManager() {
       setSyncing(true);
       try {
         const n = await syncOfflineResults();
-        if (n > 0) toast.success(`Synced ${n} saved answer${n > 1 ? "s" : ""} to your scoreboard.`);
+        if (n > 0) toast.success(`Synced ${n} saved answer${n > 1 ? "s" : ""}.`);
       } finally {
         setSyncing(false);
       }
@@ -63,9 +71,16 @@ export function ConnectivityManager() {
 
   if (online && !syncing) return null;
   return (
-    <div className="fixed bottom-4 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2 rounded-full border border-border bg-card px-4 py-2 text-xs shadow-lg" role="status">
-      {syncing ? <RefreshCw className="h-3.5 w-3.5 animate-spin text-primary" /> : <CloudOff className="h-3.5 w-3.5 text-primary" />}
-      {syncing ? "Syncing saved progress…" : "Offline — progress is saved on this device"}
+    <div
+      className="fixed bottom-16 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-border bg-card px-4 py-2 text-xs shadow-lg lg:bottom-4"
+      role="status"
+    >
+      {syncing ? (
+        <RefreshCw className="h-3.5 w-3.5 animate-spin text-primary" />
+      ) : (
+        <CloudOff className="h-3.5 w-3.5 text-primary" />
+      )}
+      <span>{syncing ? "Syncing progress…" : "Offline — progress saved locally"}</span>
     </div>
   );
 }

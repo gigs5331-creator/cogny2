@@ -33,14 +33,25 @@ export type PendingGeneration = {
 };
 
 const DB_NAME = "cogni-offline";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
-      for (const name of ["decks", "dashboard", "studyQueue", "generationQueue", "subjects", "materials", "questions", "quizAttempts", "progress"] as const) {
+      for (const name of [
+        "decks",
+        "dashboard",
+        "studyQueue",
+        "generationQueue",
+        "subjects",
+        "materials",
+        "questions",
+        "quizAttempts",
+        "progress",
+        "studyResources",
+      ] as const) {
         if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath: "id" });
       }
     };
@@ -112,7 +123,8 @@ export const removeGeneration = (id: string) => remove("generationQueue", id);
 export function makeOfflineId() {
   return crypto.randomUUID();
 }
-/* ---------- Subjects / materials / questions / attempts / progress ---------- */
+
+/* ---------- Subjects / materials / resources / questions / attempts / progress ---------- */
 
 export type OfflineSubject = {
   id: string;
@@ -124,12 +136,29 @@ export type OfflineSubject = {
 export type OfflineMaterial = {
   id: string;
   subject: string | null;
+  folder?: string | null;
   topic: string | null;
   fileName: string;
+  fileType?: string | null;
+  sizeBytes?: number;
+  chapters?: string[];
   text: string;
+  imagePages?: { base64: string; mime: string }[];
   metadata: Record<string, unknown>;
   saved: boolean;
+  lastAccessedAt?: string;
   updatedAt: string;
+};
+
+export type SavedStudyResource = {
+  id: string;
+  type: "summary" | "explanation" | "visual";
+  title: string;
+  subject: string | null;
+  materialId?: string | null;
+  chapter?: string | null;
+  content: Record<string, unknown>;
+  createdAt: string;
 };
 
 export type OfflineQuestion = {
@@ -176,11 +205,16 @@ export type OfflineProgress = {
 
 export const saveSubject = (value: OfflineSubject) => put("subjects", { ...value });
 export const listSubjects = () => getAll<OfflineSubject>("subjects");
+export const removeSubject = (id: string) => remove("subjects", id);
 
 export const saveMaterial = (value: OfflineMaterial) => put("materials", { ...value });
 export const getMaterial = (id: string) => get<OfflineMaterial>("materials", id);
 export const listMaterials = () => getAll<OfflineMaterial>("materials");
 export const removeMaterial = (id: string) => remove("materials", id);
+
+export const saveStudyResource = (value: SavedStudyResource) => put("studyResources", { ...value });
+export const listStudyResources = () => getAll<SavedStudyResource>("studyResources");
+export const removeStudyResource = (id: string) => remove("studyResources", id);
 
 export const saveQuestion = (value: OfflineQuestion) => put("questions", { ...value });
 export const listQuestions = () => getAll<OfflineQuestion>("questions");
@@ -197,13 +231,17 @@ export const getProgress = (userId: string) => get<OfflineProgress>("progress", 
 export const saveProgress = (value: OfflineProgress) => put("progress", { ...value });
 
 /** Merge an answered question into the locally-stored progress record. */
-export async function recordLocalAnswer(userId: string, input: {
-  correct: boolean;
-  topic?: string | null;
-  deckId?: string | null;
-  deckTitle?: string | null;
-  scorePct?: number | null;
-}) {
+export async function recordLocalAnswer(
+  userId: string,
+  input: {
+    correct: boolean;
+    topic?: string | null;
+    deckId?: string | null;
+    deckTitle?: string | null;
+    scorePct?: number | null;
+    durationMs?: number;
+  },
+) {
   const existing = await getProgress(userId);
   const now = new Date().toISOString();
   const attempted = (existing?.attempted ?? 0) + 1;
@@ -217,7 +255,8 @@ export async function recordLocalAnswer(userId: string, input: {
   const lastDay = existing?.lastStudiedAt ? new Date(existing.lastStudiedAt).toDateString() : null;
   const today = new Date().toDateString();
   if (lastDay !== today) {
-    const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
     streak = lastDay === yesterday.toDateString() ? streak + 1 : 1;
   }
   await saveProgress({
@@ -227,7 +266,7 @@ export async function recordLocalAnswer(userId: string, input: {
     accuracy: attempted > 0 ? Math.round((correct / attempted) * 100) : 0,
     topicMastery,
     streak,
-    studyTimeMs: existing?.studyTimeMs ?? 0,
+    studyTimeMs: (existing?.studyTimeMs ?? 0) + (input.durationMs ?? 25_000),
     lastStudiedAt: now,
     lastDeckId: input.deckId ?? existing?.lastDeckId ?? null,
     lastDeckTitle: input.deckTitle ?? existing?.lastDeckTitle ?? null,
@@ -237,11 +276,39 @@ export async function recordLocalAnswer(userId: string, input: {
   });
 }
 
+const DAILY_GOAL_KEY = "cogni:daily-goal";
+
+export function getDailyGoalTarget(): number {
+  if (typeof window === "undefined") return 20;
+  try {
+    const val = Number(window.localStorage.getItem(DAILY_GOAL_KEY));
+    return Number.isFinite(val) && val >= 5 && val <= 200 ? val : 20;
+  } catch {
+    return 20;
+  }
+}
+
+export function setDailyGoalTarget(count: number) {
+  if (typeof window === "undefined") return;
+  try {
+    const clamped = Math.max(5, Math.min(200, Math.round(count)));
+    window.localStorage.setItem(DAILY_GOAL_KEY, String(clamped));
+  } catch {
+    /* ignore */
+  }
+}
+
 /* ---------- Storage management ---------- */
 
 export async function getOfflineStorageStats() {
-  const [decks, materials, questions, attempts, pendingStudy, pendingJobs] = await Promise.all([
-    listOfflineDecks(), listMaterials(), listQuestions(), listQuizAttempts(), listStudyEvents(), listGenerations(),
+  const [decks, materials, questions, attempts, pendingStudy, pendingJobs, resources] = await Promise.all([
+    listOfflineDecks(),
+    listMaterials(),
+    listQuestions(),
+    listQuizAttempts(),
+    listStudyEvents(),
+    listGenerations(),
+    listStudyResources(),
   ]);
   let usedBytes = 0;
   try {
@@ -249,12 +316,15 @@ export async function getOfflineStorageStats() {
       const estimate = await navigator.storage.estimate();
       usedBytes = estimate.usage ?? 0;
     }
-  } catch { /* estimate unavailable */ }
+  } catch {
+    /* estimate unavailable */
+  }
   const savedQuestions = decks.reduce((sum, d) => sum + d.cards.length, 0) + questions.length;
   return {
     usedBytes,
     decks,
     materials,
+    resources,
     savedQuestions,
     quizzes: attempts.length,
     pendingSync: pendingStudy.length + pendingJobs.length,
@@ -266,7 +336,16 @@ export async function getOfflineStorageStats() {
 export async function clearOfflineData() {
   const db = await openDb();
   await new Promise<void>((resolve, reject) => {
-    const stores = ["decks", "dashboard", "materials", "questions", "quizAttempts", "progress", "subjects"] as const;
+    const stores = [
+      "decks",
+      "dashboard",
+      "materials",
+      "questions",
+      "quizAttempts",
+      "progress",
+      "subjects",
+      "studyResources",
+    ] as const;
     const tx = db.transaction(stores as unknown as string[], "readwrite");
     for (const name of stores) tx.objectStore(name).clear();
     tx.oncomplete = () => resolve();

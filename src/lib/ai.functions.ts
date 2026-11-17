@@ -8,9 +8,14 @@ const inputSchema = z.object({
   text: z.string().max(200_000).optional(),
   imageBase64: z.string().max(10_000_000).optional(),
   imageMimeType: z.string().max(64).optional(),
-  hint: z.string().max(2000).optional(),
-  targetCards: z.number().int().min(5).max(2000).optional(),
+  hint: z.string().max(4000).optional(),
+  targetCards: z.number().int().min(1).max(2000).optional(),
   exactCount: z.boolean().optional(),
+  maxExtraction: z.boolean().optional(),
+  questionFormats: z.array(z.string().max(40)).max(10).optional(),
+  difficultyFilter: z.enum(["Mixed", "Easy", "Medium", "Hard"]).optional(),
+  chapterFocus: z.string().max(300).optional(),
+  avoidQuestions: z.array(z.string().max(300)).max(150).optional(),
 });
 
 function stripJsonFences(raw: string): string {
@@ -224,50 +229,78 @@ export const generateFlashcards = createServerFn({ method: "POST" })
     if (data.imageBase64 && data.imageMimeType) {
       userContent.push({ type: "image_url", image_url: { url: `data:${data.imageMimeType};base64,${data.imageBase64}` } });
     }
+    if (data.chapterFocus) {
+      userContent.push({ type: "text", text: `Chapter / Topic focus: Focus thoroughly on "${data.chapterFocus}".` });
+    }
     if (data.hint) userContent.push({ type: "text", text: `Additional context: ${data.hint}` });
+
+    if (data.questionFormats?.length) {
+      userContent.push({
+        type: "text",
+        text: `REQUIRED QUESTION FORMATS: Distribute questions across ONLY these requested styles: ${data.questionFormats.join(", ")}. Note: For "application" or "scenario" styles, craft realistic clinical/technical/real-world scenario questions and set questionType to "multiple_choice", "short_answer", or "essay" as appropriate.`,
+      });
+    }
+
+    if (data.difficultyFilter && data.difficultyFilter !== "Mixed") {
+      userContent.push({
+        type: "text",
+        text: `DIFFICULTY REQUIREMENT: Set difficulty to "${data.difficultyFilter}" and calibrate question cognitive complexity accordingly.`,
+      });
+    }
+
+    if (data.avoidQuestions?.length) {
+      userContent.push({
+        type: "text",
+        text: `DO NOT DUPLICATE OR PARAPHRASE ANY OF THESE ALREADY-GENERATED QUESTIONS:\n${data.avoidQuestions.slice(0, 120).map((q) => `- ${q}`).join("\n")}`,
+      });
+    }
+
     if (typeof data.targetCards === "number") {
       if (data.exactCount) {
-        userContent.push({ type: "text", text: `CRITICAL: This source is a question paper containing EXACTLY ${data.targetCards} questions. You MUST generate ONE flashcard for EVERY SINGLE question in the paper — do not skip, merge, or summarise any question. Preserve the original question numbering order. Return exactly ${data.targetCards} cards.` });
+        userContent.push({
+          type: "text",
+          text: `CRITICAL EXACT COUNT REQUIREMENT: Return EXACTLY ${data.targetCards} distinct, high-quality academic questions in the "cards" array — no fewer, no duplicates. Extract every explicit question first (including every sub-part a, b, i, ii) and synthesize additional deep concept/application/scenario questions from the source material until you reach EXACTLY ${data.targetCards} cards.`,
+        });
+      } else if (data.maxExtraction) {
+        userContent.push({
+          type: "text",
+          text: `MAXIMUM EXTRACTION MODE: Extract AS MANY high-quality, non-duplicate questions as possible from this source (aim for at least ${data.targetCards} cards if supported by the content). Mine every single definition, theorem, formula, mechanism, comparison, cause-effect link, worked example, table entry, and sub-question. Do NOT summarize away details or skip minor facts.`,
+        });
       } else {
-        userContent.push({ type: "text", text: `IMPORTANT: Generate approximately ${data.targetCards} flashcards from this material (±10%). Cover every distinct concept — do not leave any topic out.` });
+        userContent.push({
+          type: "text",
+          text: `IMPORTANT: Generate approximately ${data.targetCards} flashcards from this material (±10%). Cover every distinct concept — do not leave any topic out.`,
+        });
       }
     }
     if (userContent.length === 0) throw new Error("Provide text or an image");
 
-    const system = `You are an expert university tutor that turns study material into high-quality, EXAM-GRADE flashcards.
+    const system = `You are an expert university tutor that turns study material into high-quality, EXAM-GRADE flashcards and questions.
 
 CONTENT FILTER — READ FIRST (mandatory):
 Before writing anything, silently classify every part of the source as either ADMINISTRATIVE/METADATA or ACADEMIC CONTENT, and then generate questions ONLY from the ACADEMIC CONTENT.
 - ADMINISTRATIVE/METADATA (NEVER turn into a question, never ask "who", "when", "how many marks" about it): university / faculty / department names, course codes and course titles, examiner / moderator / lecturer / invigilator names, exam dates, duration, venue, session, student number fields, exam or section instructions ("Answer any three questions", "Write in ink", "Calculators allowed", "Turn over"), marks allocation ("[10 marks]"), question numbering, page numbers, headers, footers, copyright lines, submission or answer-sheet instructions, plagiarism declarations, table-of-contents entries.
 - ACADEMIC CONTENT: definitions, concepts, theories, principles, formulas, derivations, worked calculations, examples, case studies, comparisons, causes/effects, processes, classifications, relationships and data that test real knowledge.
-- If the source is a past examination paper: first separate the examination instructions from the ACTUAL EXAMINABLE QUESTIONS, then build cards only from those examinable questions and their subject matter. Never treat an instruction as learning content.
+- If the source is a past examination paper: first separate the examination instructions from the ACTUAL EXAMINABLE QUESTIONS, then build cards from every single examinable question and sub-question.
 - Strip marks annotations, numbering and instruction fragments out of the question text you output — keep only the academic question itself.
 - If a section contains nothing but administrative material, return no cards for it rather than inventing questions about it.
 
 Rules:
-- Extract every distinct ACADEMIC question in the source. If answers are present, use them; otherwise generate accurate answers from your knowledge.
-
-- Each card MUST have: question, concise answer, a 3-5 sentence explanation that TEACHES the concept, a topic tag (use the actual topic / chapter name from the source if it has "Topic 1", "Topic 2", "Chapter X" etc — preserve that exact label), a difficulty (Easy, Medium, or Hard), a questionType, and EXACTLY 3 distractors.
+- Extract EVERY distinct ACADEMIC question, concept, formula, definition, comparison, and sub-question in the source. If answers are present, use them; otherwise generate accurate answers from your knowledge.
+- Each card MUST have: question, concise answer, a 3-5 sentence explanation that TEACHES the concept, a topic tag (preserve "Topic X" / "Chapter X" if present), a difficulty (Easy, Medium, or Hard), a questionType, and EXACTLY 3 distractors.
 - QUESTION TYPE — mandatory and explicit. Set "questionType" to exactly one of: multiple_choice, true_false, short_answer, numerical, essay. Never leave it out.
   * multiple_choice: you MUST also return an "options" array of EXACTLY 4 non-empty options, and the "answer" MUST be character-for-character identical to one of those options.
-  * If the question wording is "Which of the following…", "Which one of these…", "All of the following except…", "Which statement is correct…" or similar, it MUST be multiple_choice WITH options. If you cannot produce real options from the source, REWRITE the question as a direct short_answer question instead — never leave that wording without options.
+  * If the question wording is "Which of the following…", "Which one of these…", "All of the following except…", "Which statement is correct…" or similar, it MUST be multiple_choice WITH 4 options.
   * true_false: the answer MUST be exactly "True" or "False". Do not return options.
   * numerical: the answer is a number (with units if relevant) — short factual computation.
-  * essay: long-form answer; the explanation must contain the marking points / model answer.
-  * short_answer: everything else; the answer is a concise sentence or phrase.
-- DISTRACTORS — this is critical for exam quality:
+  * essay: long-form / application / scenario answer; the explanation must contain the marking points / model answer.
+  * short_answer: concise sentence or phrase answer.
+- DISTRACTORS — critical for exam quality:
   * Each distractor MUST be plausible and based on a COMMON STUDENT MISCONCEPTION, a near-miss calculation, or a closely-related-but-wrong concept on the same topic.
-  * Distractors MUST be similar in length, tone, formatting and level of detail to the correct answer (within ±25% character length). Never make the correct answer noticeably longer, more detailed, or more "textbook-sounding" than the distractors.
-  * Do NOT use generic fillers like "None of the above", "All of the above", "Not sure".
-  * For MATH: distractors are wrong final numerical/symbolic results from realistic mistakes (sign error, off-by-one, swapped formula, missing factor). Format them the same way as the correct answer (same LaTeX, same units).
-- MATH & SCIENCE: when the topic involves mathematics, physics, chemistry, statistics, economics, engineering or any formulas, ALWAYS write equations, variables, fractions, integrals, matrices, units and Greek letters using LaTeX. Use $...$ for inline math and $$...$$ for displayed equations. Never write math as plain text like "x^2" or "1/2".
-- For math/word problems, the explanation MUST show a clear step-by-step worked solution, each numbered step on its own line, with the final answer highlighted. Include the question RESTATED, the formula(s) used, substitutions, and the answer with units.
-- DIAGRAMS: when a visual would clarify the question or answer (geometry, triangles, circles, graphs of functions, force/free-body diagrams, circuits, biology anatomy, chemistry molecules/reactions, flowcharts, number lines, bar/pie charts, coordinate plots), include a clear inline SVG in the "diagram" field. Otherwise OMIT the field.
-  * SVG rules: self-contained <svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">…</svg>. No <script>, no external images, no <foreignObject>. Use stroke="currentColor" / fill="currentColor" (or explicit web-safe colours) so it works on dark backgrounds. Use <text> for labels. Keep it crisp and clean — illustrative, not decorative.
-  * If the source document already references a figure (e.g. "see Fig 2.3"), recreate the essential diagram so the student can answer without the original.
-- TOPIC GROUPING: if the source clearly splits into multiple topics/chapters/parts (e.g. "Topic 1: Limits", "Topic 2: Derivatives"), tag each card with the exact topic label so students can practise one topic at a time.
-- If the source is not a list of questions, create comprehensive flashcards that cover every important concept.
-- CARD COUNT — scale to the source. Small source (≤500 words): 8-15 cards. Medium (500-3000 words): 20-40 cards. Large (3000-15000 words / multi-topic / textbook chapter / past paper bundle): 50-100 cards, covering EVERY topic and sub-topic — do not leave material out. Never return fewer than 8. Be thorough but avoid near-duplicates.`;
+  * Distractors MUST be similar in length, tone, and formatting to the correct answer. Do NOT use "None of the above" or "All of the above".
+- MATH & SCIENCE: ALWAYS write equations, variables, fractions, integrals, matrices, units and Greek letters using LaTeX ($...$ inline, $$...$$ displayed). For math/word problems, the explanation MUST show numbered step-by-step calculations.
+- DIAGRAMS: when a visual clarifies the question (geometry, graphs, free-body diagrams, circuits, biology anatomy, chemistry structures, flowcharts), include a crisp inline SVG (<svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">…</svg>, no scripts/foreignObject) in "diagram". Otherwise OMIT "diagram".
+- EXHAUSTIVENESS: Do not compress multiple concepts into 1 question — split multi-part topics and sub-questions (a), (b), (i), (ii) into separate cards so the student gets maximum coverage.`;
 
     const body = {
       model: "google/gemini-2.5-flash",
@@ -275,41 +308,43 @@ Rules:
         { role: "system", content: system },
         { role: "user", content: userContent },
       ],
-      tools: [{
-        type: "function",
-        function: {
-          name: "save_flashcards",
-          description: "Save the generated flashcards",
-          parameters: {
-            type: "object",
-            properties: {
-              suggested_title: { type: "string" },
-              suggested_subject: { type: "string" },
-              cards: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: {
-                    question: { type: "string" },
-                    answer: { type: "string" },
-                    explanation: { type: "string" },
-                    topic: { type: "string" },
-                    difficulty: { type: "string", enum: ["Easy", "Medium", "Hard"] },
-                    questionType: { type: "string", enum: ["multiple_choice", "true_false", "short_answer", "numerical", "essay"] },
-                    options: { type: "array", items: { type: "string" }, description: "Exactly 4 options — REQUIRED when questionType is multiple_choice. The answer must be one of them. Omit for other types." },
-                    distractors: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 3 },
-                    diagram: { type: "string", description: "Optional inline SVG diagram. Omit if not needed." },
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "save_flashcards",
+            description: "Save the generated flashcards",
+            parameters: {
+              type: "object",
+              properties: {
+                suggested_title: { type: "string" },
+                suggested_subject: { type: "string" },
+                cards: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      question: { type: "string" },
+                      answer: { type: "string" },
+                      explanation: { type: "string" },
+                      topic: { type: "string" },
+                      difficulty: { type: "string", enum: ["Easy", "Medium", "Hard"] },
+                      questionType: { type: "string", enum: ["multiple_choice", "true_false", "short_answer", "numerical", "essay"] },
+                      options: { type: "array", items: { type: "string" }, description: "Exactly 4 options — REQUIRED when questionType is multiple_choice. The answer must be one of them. Omit for other types." },
+                      distractors: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 3 },
+                      diagram: { type: "string", description: "Optional inline SVG diagram. Omit if not needed." },
+                    },
+                    required: ["question", "answer", "explanation", "topic", "difficulty", "questionType", "distractors"],
+                    additionalProperties: false,
                   },
-                  required: ["question", "answer", "explanation", "topic", "difficulty", "questionType", "distractors"],
-                  additionalProperties: false,
                 },
               },
+              required: ["suggested_title", "suggested_subject", "cards"],
+              additionalProperties: false,
             },
-            required: ["suggested_title", "suggested_subject", "cards"],
-            additionalProperties: false,
           },
         },
-      }],
+      ],
       tool_choice: { type: "function", function: { name: "save_flashcards" } },
     };
 
@@ -350,33 +385,35 @@ Rules:
         { role: "system", content: system },
         { role: "user", content: data.text },
       ],
-      tools: [{
-        type: "function",
-        function: {
-          name: "save_structure",
-          parameters: {
-            type: "object",
-            properties: {
-              administrative: {
-                type: "object",
-                properties: {
-                  course_code: { type: "string" },
-                  course_title: { type: "string" },
-                  examiner: { type: "string" },
-                  exam_instructions: { type: "array", items: { type: "string" } },
-                  section_instructions: { type: "array", items: { type: "string" } },
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "save_structure",
+            parameters: {
+              type: "object",
+              properties: {
+                administrative: {
+                  type: "object",
+                  properties: {
+                    course_code: { type: "string" },
+                    course_title: { type: "string" },
+                    examiner: { type: "string" },
+                    exam_instructions: { type: "array", items: { type: "string" } },
+                    section_instructions: { type: "array", items: { type: "string" } },
+                  },
+                  additionalProperties: false,
                 },
-                additionalProperties: false,
+                academic_content: { type: "string" },
+                topics: { type: "array", items: { type: "string" } },
+                is_exam_paper: { type: "boolean" },
               },
-              academic_content: { type: "string" },
-              topics: { type: "array", items: { type: "string" } },
-              is_exam_paper: { type: "boolean" },
+              required: ["academic_content", "topics"],
+              additionalProperties: false,
             },
-            required: ["academic_content", "topics"],
-            additionalProperties: false,
           },
         },
-      }],
+      ],
       tool_choice: { type: "function", function: { name: "save_structure" } },
     });
     const tc = json.choices?.[0]?.message?.tool_calls?.[0];
@@ -389,6 +426,185 @@ Rules:
       isExamPaper: Boolean(parsed?.is_exam_paper),
       administrative: parsed?.administrative ?? {},
     };
+  });
+
+// Study Studio: Generate structured Summaries, Detailed Explanations, or Visual Learning Diagrams
+export const generateStudyResource = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) =>
+    z.object({
+      resourceType: z.enum(["summary", "explanation", "visual"]),
+      text: z.string().min(10).max(120_000),
+      chapterFocus: z.string().max(300).optional(),
+      hint: z.string().max(2000).optional(),
+    }).parse(d),
+  )
+  .handler(async ({ data }) => {
+    const focusLine = data.chapterFocus ? `\nChapter / Topic focus: ${data.chapterFocus}` : "";
+    const hintLine = data.hint ? `\nAdditional instructions: ${data.hint}` : "";
+
+    if (data.resourceType === "summary") {
+      const json = await callChat({
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are an expert university academic summariser. Produce crisp, exam-ready chapter summaries, topic summaries, key definitions, key concepts, and high-yield revision notes. Use LaTeX ($...$ / $$...$$) for formulas.",
+          },
+          { role: "user", content: `Source material:${focusLine}${hintLine}\n\n${data.text.slice(0, 60_000)}` },
+        ],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "save_summary",
+              parameters: {
+                type: "object",
+                properties: {
+                  title: { type: "string" },
+                  subject: { type: "string" },
+                  overview: { type: "string" },
+                  chapterSummaries: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        heading: { type: "string" },
+                        summary: { type: "string" },
+                        keyTakeaways: { type: "array", items: { type: "string" } },
+                      },
+                      required: ["heading", "summary", "keyTakeaways"],
+                    },
+                  },
+                  definitions: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        term: { type: "string" },
+                        definition: { type: "string" },
+                      },
+                      required: ["term", "definition"],
+                    },
+                  },
+                  revisionNotes: { type: "array", items: { type: "string" } },
+                },
+                required: ["title", "subject", "overview", "chapterSummaries", "definitions", "revisionNotes"],
+              },
+            },
+          },
+        ],
+      });
+      const tc = json.choices?.[0]?.message?.tool_calls?.[0];
+      const raw = tc?.function?.arguments ?? json.choices?.[0]?.message?.content;
+      if (!raw) throw new Error("Summary generation returned empty output");
+      return { kind: "summary" as const, data: JSON.parse(stripJsonFences(raw)) };
+    }
+
+    if (data.resourceType === "explanation") {
+      const json = await callChat({
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a master university lecturer. Break down complex material into intuitive simplified explanations, numbered step-by-step solutions, worked examples, and common student misconceptions. Use LaTeX ($...$ / $$...$$) for math and science equations.",
+          },
+          { role: "user", content: `Source material:${focusLine}${hintLine}\n\n${data.text.slice(0, 60_000)}` },
+        ],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "save_explanation",
+              parameters: {
+                type: "object",
+                properties: {
+                  title: { type: "string" },
+                  subject: { type: "string" },
+                  simplifiedExplanation: { type: "string" },
+                  stepByStepBreakdown: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        stepNumber: { type: "integer" },
+                        title: { type: "string" },
+                        explanation: { type: "string" },
+                        formula: { type: "string" },
+                      },
+                      required: ["stepNumber", "title", "explanation"],
+                    },
+                  },
+                  workedExamples: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        problem: { type: "string" },
+                        solution: { type: "string" },
+                        takeaway: { type: "string" },
+                      },
+                      required: ["problem", "solution", "takeaway"],
+                    },
+                  },
+                  commonMisconceptions: { type: "array", items: { type: "string" } },
+                },
+                required: ["title", "subject", "simplifiedExplanation", "stepByStepBreakdown", "workedExamples", "commonMisconceptions"],
+              },
+            },
+          },
+        ],
+      });
+      const tc = json.choices?.[0]?.message?.tool_calls?.[0];
+      const raw = tc?.function?.arguments ?? json.choices?.[0]?.message?.content;
+      if (!raw) throw new Error("Explanation generation returned empty output");
+      return { kind: "explanation" as const, data: JSON.parse(stripJsonFences(raw)) };
+    }
+
+    const json = await callChat({
+      messages: [
+        {
+          role: "system",
+          content:
+            'You are an academic visual illustrator. Create 2 to 4 crisp, accurate educational SVG diagrams (<svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">...</svg>) that visually explain the core processes, architectures, graphs, cycles, or relationships in the material. Use clean strokes (stroke="#477BFF", stroke="#54D6E8", stroke="currentColor"), legible <text> labels, and NO <script> or <foreignObject>. Also provide structured visual breakdown steps for each diagram.',
+        },
+        { role: "user", content: `Source material:${focusLine}${hintLine}\n\n${data.text.slice(0, 60_000)}` },
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "save_visual_guide",
+            parameters: {
+              type: "object",
+              properties: {
+                title: { type: "string" },
+                subject: { type: "string" },
+                conceptSummary: { type: "string" },
+                diagrams: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      title: { type: "string" },
+                      caption: { type: "string" },
+                      svg: { type: "string" },
+                      breakdownSteps: { type: "array", items: { type: "string" } },
+                    },
+                    required: ["title", "caption", "svg", "breakdownSteps"],
+                  },
+                },
+              },
+              required: ["title", "subject", "conceptSummary", "diagrams"],
+            },
+          },
+        },
+      ],
+    });
+    const tc = json.choices?.[0]?.message?.tool_calls?.[0];
+    const raw = tc?.function?.arguments ?? json.choices?.[0]?.message?.content;
+    if (!raw) throw new Error("Visual guide generation returned empty output");
+    return { kind: "visual" as const, data: JSON.parse(stripJsonFences(raw)) };
   });
 
 // Generate a quiz from existing cards (turns answers into MCQs with distractors)

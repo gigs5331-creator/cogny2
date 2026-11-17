@@ -6,7 +6,17 @@ import { MathText } from "@/components/math-text";
 import { Diagram } from "@/components/diagram";
 import { resolveQuestion, TYPE_INSTRUCTIONS, TYPE_LABELS } from "@/lib/question-types";
 
-type Card = { id: string; question: string; answer: string; explanation: string | null; topic?: string | null; distractors?: string[] | null; diagram?: string | null; questionType?: string | null; options?: string[] | null };
+type Card = {
+  id: string;
+  question: string;
+  answer: string;
+  explanation: string | null;
+  topic?: string | null;
+  distractors?: string[] | null;
+  diagram?: string | null;
+  questionType?: string | null;
+  options?: string[] | null;
+};
 
 type Option = { text: string; correct: boolean };
 
@@ -20,7 +30,6 @@ function shuffle<T>(arr: T[]): T[] {
 }
 
 function normaliseLen(s: string, target: number): string {
-  // Trim very long distractors so options look uniform; don't expand short ones.
   const max = Math.max(target + 30, Math.round(target * 1.4));
   if (s.length > max) return s.slice(0, max - 1).trimEnd() + "…";
   return s;
@@ -29,10 +38,12 @@ function normaliseLen(s: string, target: number): string {
 function buildOptions(card: Card, all: Card[]): Option[] {
   const resolved = resolveQuestion(card);
 
-  // Authored options (multiple choice / true-false) always win — never rebuild them.
   if (resolved.options.length >= 2) {
     const answer = card.answer.trim().toLowerCase();
-    const opts = resolved.options.map((text) => ({ text, correct: text.trim().toLowerCase() === answer }));
+    const opts = resolved.options.map((text) => ({
+      text,
+      correct: text.trim().toLowerCase() === answer,
+    }));
     if (!opts.some((o) => o.correct)) opts[0] = { text: card.answer, correct: true };
     return resolved.type === "true_false" ? opts : shuffle(opts);
   }
@@ -41,10 +52,14 @@ function buildOptions(card: Card, all: Card[]): Option[] {
   if (card.distractors && card.distractors.length >= 3) {
     distractors = card.distractors.slice(0, 3);
   } else {
-    // Fallback: pick distractors from same-topic cards first, then anywhere.
-    const sameTopic = all.filter((c) => c.id !== card.id && c.topic && card.topic && c.topic === card.topic).map((c) => c.answer);
+    const sameTopic = all
+      .filter((c) => c.id !== card.id && c.topic && card.topic && c.topic === card.topic)
+      .map((c) => c.answer);
     const others = all.filter((c) => c.id !== card.id).map((c) => c.answer);
-    const pool = sameTopic.length >= 3 ? sameTopic : [...sameTopic, ...others.filter((a) => !sameTopic.includes(a))];
+    const pool =
+      sameTopic.length >= 3
+        ? sameTopic
+        : [...sameTopic, ...others.filter((a) => !sameTopic.includes(a))];
     distractors = shuffle(pool).slice(0, 3);
     while (distractors.length < 3) distractors.push("—");
   }
@@ -56,7 +71,21 @@ function buildOptions(card: Card, all: Card[]): Option[] {
   return shuffle(opts);
 }
 
-export function MultipleChoiceMode({ deckId, cards, onComplete, onAnswered, part = 0, guestLimit }: { deckId: string; cards: Card[]; onComplete: (score: number, total: number) => void; onAnswered?: (score: number, total: number) => void; part?: number; guestLimit?: number }) {
+export function MultipleChoiceMode({
+  deckId,
+  cards,
+  onComplete,
+  onAnswered,
+  part = 0,
+  guestLimit,
+}: {
+  deckId: string;
+  cards: Card[];
+  onComplete: (score: number, total: number) => void;
+  onAnswered?: (score: number, total: number) => void;
+  part?: number;
+  guestLimit?: number;
+}) {
   const quiz = useMemo(() => cards, [cards]);
   const storageKey = `mc:${deckId}:p${part}`;
 
@@ -69,12 +98,10 @@ export function MultipleChoiceMode({ deckId, cards, onComplete, onAnswered, part
   const optionsRef = useRef<Option[][]>([]);
   const completedRef = useRef(false);
 
-  // Build options once per quiz
   if (optionsRef.current.length === 0 && quiz.length > 0) {
     optionsRef.current = quiz.map((c) => buildOptions(c, quiz));
   }
 
-  // Restore saved progress
   useEffect(() => {
     if (resumed || quiz.length === 0) return;
     try {
@@ -86,16 +113,22 @@ export function MultipleChoiceMode({ deckId, cards, onComplete, onAnswered, part
           setAnswers(s.answers);
         }
       }
-    } catch {}
+    } catch {
+      /* ignore */
+    }
     setResumed(true);
   }, [resumed, quiz.length, storageKey]);
 
-  // Persist progress
   useEffect(() => {
     if (!resumed || finished) return;
     try {
-      localStorage.setItem(storageKey, JSON.stringify({ idx, answers, total: quiz.length, ts: Date.now() }));
-    } catch {}
+      localStorage.setItem(
+        storageKey,
+        JSON.stringify({ idx, answers, total: quiz.length, ts: Date.now() }),
+      );
+    } catch {
+      /* ignore */
+    }
   }, [idx, answers, quiz.length, storageKey, resumed, finished]);
 
   function pick(optionIdx: number) {
@@ -107,11 +140,9 @@ export function MultipleChoiceMode({ deckId, cards, onComplete, onAnswered, part
       return next;
     });
     setRevealed(true);
-    // Bank this answer immediately so it counts even if the quiz is abandoned.
     const isCorrect = Boolean(optionsRef.current[idx]?.[optionIdx]?.correct);
     onAnswered?.(isCorrect ? 1 : 0, 1);
   }
-
 
   function next() {
     setSelected(null);
@@ -124,7 +155,11 @@ export function MultipleChoiceMode({ deckId, cards, onComplete, onAnswered, part
   }
 
   function restart() {
-    try { localStorage.removeItem(storageKey); } catch {}
+    try {
+      localStorage.removeItem(storageKey);
+    } catch {
+      /* ignore */
+    }
     optionsRef.current = quiz.map((c) => buildOptions(c, quiz));
     completedRef.current = false;
     setAnswers([]);
@@ -145,32 +180,53 @@ export function MultipleChoiceMode({ deckId, cards, onComplete, onAnswered, part
   useEffect(() => {
     if (!finished || completedRef.current) return;
     completedRef.current = true;
-    try { localStorage.removeItem(storageKey); } catch {}
+    try {
+      localStorage.removeItem(storageKey);
+    } catch {
+      /* ignore */
+    }
     onComplete?.(score, quiz.length);
   }, [finished, score, quiz.length, onComplete, storageKey]);
 
-  if (quiz.length === 0) return <p className="text-center text-muted-foreground py-12">No cards in this deck yet.</p>;
+  if (quiz.length === 0) {
+    return <p className="py-12 text-center text-sm text-muted-foreground">No questions in this deck yet.</p>;
+  }
 
   if (finished) {
     const pct = Math.round((score / quiz.length) * 100);
-    const tone = pct >= 80 ? "Outstanding!" : pct >= 60 ? "Nice work — keep going!" : pct >= 40 ? "Solid start — review and try again." : "Don't sweat it — practise makes perfect.";
+    const tone =
+      pct >= 80
+        ? "Outstanding!"
+        : pct >= 60
+          ? "Solid work — keep going!"
+          : pct >= 40
+            ? "Good start — review missed items."
+            : "Keep practising — consistency pays off.";
     function shareWA() {
       const url = typeof window !== "undefined" ? window.location.href : "";
-      const msg = encodeURIComponent(`I just scored ${score}/${quiz.length} (${pct}%) on a Cogny AI quiz! Try it: ${url}`);
+      const msg = encodeURIComponent(
+        `I scored ${score}/${quiz.length} (${pct}%) on a COGNY quiz! Practise it here: ${url}`,
+      );
       window.open(`https://wa.me/?text=${msg}`, "_blank", "noopener,noreferrer");
     }
     return (
-      <div className="space-y-6">
-        <div className="rounded-3xl border border-border bg-gradient-to-br from-primary/10 via-card to-card p-8 text-center glow-soft">
-          <div className="mx-auto inline-flex h-14 w-14 items-center justify-center rounded-full bg-primary/15">
-            {pct >= 60 ? <Trophy className="h-7 w-7 text-primary" /> : <PartyPopper className="h-7 w-7 text-primary" />}
+      <div className="mx-auto max-w-3xl space-y-6">
+        <div className="rounded-2xl border border-border bg-card p-8 text-center shadow-sm">
+          <div className="mx-auto inline-flex h-12 w-12 items-center justify-center rounded-xl bg-primary/10 text-primary">
+            {pct >= 60 ? <Trophy className="h-6 w-6" /> : <PartyPopper className="h-6 w-6" />}
           </div>
-          <h2 className="mt-4 font-display text-4xl font-bold tracking-tight">{score} <span className="text-2xl text-muted-foreground">/ {quiz.length}</span></h2>
-          <p className="mt-1 text-sm text-muted-foreground">{pct}% · {tone}</p>
+          <h2 className="mt-4 font-display text-4xl font-bold tracking-tight tabular-nums text-foreground">
+            {score} <span className="text-2xl text-muted-foreground">/ {quiz.length}</span>
+          </h2>
+          <p className="mt-1 text-sm text-muted-foreground tabular-nums">
+            {pct}% · {tone}
+          </p>
           <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
-            <Button onClick={restart} size="lg"><RotateCcw className="h-4 w-4 mr-2" /> Play again</Button>
-            <Button onClick={shareWA} size="lg" variant="outline" className="text-green-600 border-green-200 hover:bg-green-50 hover:text-green-700">
-              <MessageCircle className="h-4 w-4 mr-2" /> Share on WhatsApp
+            <Button onClick={restart} size="lg">
+              <RotateCcw className="h-4 w-4 mr-2" /> Play again
+            </Button>
+            <Button onClick={shareWA} size="lg" variant="outline">
+              <MessageCircle className="h-4 w-4 mr-2 text-success" /> Share on WhatsApp
             </Button>
           </div>
         </div>
@@ -181,14 +237,39 @@ export function MultipleChoiceMode({ deckId, cards, onComplete, onAnswered, part
             const correctIdx = opts.findIndex((o) => o.correct);
             const right = pickIdx !== null && pickIdx !== undefined && opts[pickIdx]?.correct;
             return (
-              <div key={q.id} className={`rounded-2xl border p-5 ${right ? "border-success/30 bg-success/5" : "border-destructive/30 bg-destructive/5"}`}>
+              <div key={q.id} className="rounded-xl border border-border bg-card p-5">
                 <div className="flex items-start gap-3">
-                  {right ? <Check className="h-5 w-5 text-success mt-0.5" /> : <X className="h-5 w-5 text-destructive mt-0.5" />}
-                  <div className="flex-1">
-                    <p className="font-mono text-sm"><MathText>{q.question}</MathText></p>
-                    <p className="mt-2 text-sm"><span className="text-muted-foreground">Your answer: </span>{pickIdx !== null && pickIdx !== undefined ? <MathText>{opts[pickIdx]?.text}</MathText> : <em className="text-muted-foreground">(skipped)</em>}</p>
-                    {!right && <p className="mt-1 text-sm"><span className="text-muted-foreground">Correct: </span><span className="font-medium"><MathText>{opts[correctIdx]?.text}</MathText></span></p>}
-                    {q.explanation && <p className="mt-2 text-xs text-muted-foreground"><MathText>{q.explanation}</MathText></p>}
+                  {right ? (
+                    <Check className="mt-0.5 h-5 w-5 shrink-0 text-success" />
+                  ) : (
+                    <X className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <p className="font-mono text-sm text-foreground">
+                      <span className="mr-1.5 text-muted-foreground tabular-nums">#{i + 1}</span>
+                      <MathText>{q.question}</MathText>
+                    </p>
+                    <p className="mt-2 text-sm">
+                      <span className="text-muted-foreground">Your answer: </span>
+                      {pickIdx !== null && pickIdx !== undefined ? (
+                        <MathText>{opts[pickIdx]?.text}</MathText>
+                      ) : (
+                        <em className="text-muted-foreground">(skipped)</em>
+                      )}
+                    </p>
+                    {!right && (
+                      <p className="mt-1 text-sm">
+                        <span className="text-muted-foreground">Correct: </span>
+                        <span className="font-medium text-foreground">
+                          <MathText>{opts[correctIdx]?.text}</MathText>
+                        </span>
+                      </p>
+                    )}
+                    {q.explanation && (
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        <MathText>{q.explanation}</MathText>
+                      </p>
+                    )}
                   </div>
                 </div>
               </div>
@@ -203,59 +284,76 @@ export function MultipleChoiceMode({ deckId, cards, onComplete, onAnswered, part
   const opts = optionsRef.current[idx] ?? [];
   const progress = ((idx + 1) / quiz.length) * 100;
 
-  // Guest paywall: after answering `guestLimit` questions, prompt signup on the next card.
   if (guestLimit !== undefined && idx >= guestLimit) {
-    const nextPath = typeof window !== "undefined" ? `${window.location.pathname}${window.location.search}` : "";
+    const nextPath =
+      typeof window !== "undefined" ? `${window.location.pathname}${window.location.search}` : "";
     return (
       <div className="mx-auto max-w-2xl">
-        <div className="rounded-3xl border border-primary/30 bg-gradient-to-br from-primary/10 via-card to-card p-8 text-center glow-soft">
-          <div className="mx-auto inline-flex h-14 w-14 items-center justify-center rounded-full bg-primary/15">
-            <Lock className="h-7 w-7 text-primary" />
+        <div className="rounded-2xl border border-border bg-card p-8 text-center shadow-sm">
+          <div className="mx-auto inline-flex h-12 w-12 items-center justify-center rounded-xl bg-primary/10 text-primary">
+            <Lock className="h-6 w-6" />
           </div>
-          <h2 className="mt-4 font-display text-3xl font-bold tracking-tight">Nice work — keep going?</h2>
-          <p className="mt-2 text-sm text-muted-foreground max-w-md mx-auto">
-            You've tried {guestLimit} questions on this deck. Create a free account to unlock the rest,
-            save your score to the leaderboard, and build your own decks in seconds.
+          <h2 className="mt-4 font-display text-2xl font-bold tracking-tight text-foreground">
+            Create a free account to continue
+          </h2>
+          <p className="mt-2 mx-auto max-w-md text-sm text-muted-foreground">
+            You completed {guestLimit} preview questions. Sign up free to unlock the entire bank, save analytics, and access Study Studio.
           </p>
           <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
             <Button asChild size="lg">
               <Link to="/login" search={{ mode: "signup", ...(nextPath ? { next: nextPath } : {}) }}>
-                <Sparkles className="h-4 w-4 mr-2" /> Sign up free to continue
+                <Sparkles className="h-4 w-4 mr-2" /> Sign up free
               </Link>
             </Button>
             <Button asChild variant="outline" size="lg">
-              <Link to="/login" search={{ mode: "signin", ...(nextPath ? { next: nextPath } : {}) }}>I already have an account</Link>
+              <Link to="/login" search={{ mode: "signin", ...(nextPath ? { next: nextPath } : {}) }}>
+                Sign in
+              </Link>
             </Button>
           </div>
-          <p className="mt-4 text-xs text-muted-foreground">Takes ~15 seconds · free forever for students</p>
         </div>
       </div>
     );
   }
 
-
   return (
-    <div className="space-y-6 mx-auto max-w-2xl">
-      <div className="flex items-center justify-between text-xs text-muted-foreground">
-        <span>Question {idx + 1} / {quiz.length}</span>
+    <div className="mx-auto max-w-2xl space-y-6">
+      <div className="flex items-center justify-between text-xs text-muted-foreground tabular-nums">
+        <span>
+          Question {idx + 1} / {quiz.length}
+        </span>
       </div>
-      <div className="h-2 sm:h-2.5 bg-muted rounded-full overflow-hidden ring-1 ring-border/50">
-        <div className="h-full bg-primary transition-all duration-300" style={{ width: `${progress}%` }} />
+      <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+        <div
+          className="h-full bg-primary transition-all duration-300"
+          style={{ width: `${progress}%` }}
+        />
       </div>
 
       <div className="perspective">
-        <div className={`preserve-3d flip-transition relative w-full rounded-3xl grid ${revealed ? "rotate-y-180" : ""}`}>
+        <div
+          className={`preserve-3d flip-transition relative grid w-full rounded-2xl ${
+            revealed ? "rotate-y-180" : ""
+          }`}
+        >
           {/* FRONT */}
-          <div className="backface-hidden [grid-area:1/1] rounded-3xl border border-border bg-card p-4 sm:p-8 flex flex-col glow-soft">
-
-            <div className="mb-3 flex flex-wrap items-center gap-2">
-              <span className="text-xs uppercase tracking-wider text-muted-foreground">{TYPE_LABELS[resolveQuestion(q).type === "true_false" ? "true_false" : "multiple_choice"]}</span>
-              <span className="text-xs text-muted-foreground/80">· {resolveQuestion(q).type === "true_false" ? TYPE_INSTRUCTIONS.true_false : TYPE_INSTRUCTIONS.multiple_choice}</span>
+          <div className="backface-hidden [grid-area:1/1] flex flex-col rounded-2xl border border-border bg-card p-5 sm:p-8 shadow-sm">
+            <div className="mb-3 flex flex-wrap items-center gap-2 font-mono text-xs text-muted-foreground">
+              <span className="font-semibold uppercase text-primary">
+                {TYPE_LABELS[resolveQuestion(q).type === "true_false" ? "true_false" : "multiple_choice"]}
+              </span>
+              <span>
+                ·{" "}
+                {resolveQuestion(q).type === "true_false"
+                  ? TYPE_INSTRUCTIONS.true_false
+                  : TYPE_INSTRUCTIONS.multiple_choice}
+              </span>
             </div>
-            <p className="font-mono text-base sm:text-lg leading-relaxed break-words"><MathText>{q.question}</MathText></p>
+            <p className="font-mono text-base sm:text-lg leading-relaxed break-words text-foreground">
+              <MathText>{q.question}</MathText>
+            </p>
             <Diagram svg={q.diagram} />
-            <div className="mt-5 flex-1 grid gap-2 sm:gap-3 auto-rows-fr">
-
+            <div className="mt-5 flex-1 grid gap-2.5 auto-rows-fr">
               {opts.map((o, i) => {
                 const isSel = selected === i;
                 return (
@@ -263,11 +361,19 @@ export function MultipleChoiceMode({ deckId, cards, onComplete, onAnswered, part
                     key={i}
                     disabled={selected !== null}
                     onClick={() => pick(i)}
-                    className={`text-left rounded-xl sm:rounded-2xl border-2 px-3 py-2.5 sm:p-4 transition-all h-full ${isSel ? "border-primary bg-primary/10" : "border-border hover:border-primary/50 hover:bg-accent"} disabled:cursor-not-allowed`}
+                    className={`h-full rounded-xl border px-3.5 py-3 text-left transition ${
+                      isSel
+                        ? "border-primary bg-primary/10"
+                        : "border-border bg-background hover:border-primary/50"
+                    } disabled:cursor-not-allowed`}
                   >
                     <div className="flex items-start gap-3 min-w-0">
-                      <span className="shrink-0 grid h-6 w-6 place-items-center rounded-md bg-muted text-xs font-semibold">{String.fromCharCode(65 + i)}</span>
-                      <span className="text-sm min-w-0 flex-1 break-words [&_.katex]:whitespace-normal [&_.katex-display]:my-1 [&_.katex-display]:overflow-x-auto [&_.katex-display]:max-w-full"><MathText>{o.text}</MathText></span>
+                      <span className="shrink-0 grid h-6 w-6 place-items-center rounded-md border border-border bg-card font-mono text-xs font-semibold text-foreground">
+                        {String.fromCharCode(65 + i)}
+                      </span>
+                      <span className="min-w-0 flex-1 break-words text-sm text-foreground [&_.katex]:whitespace-normal [&_.katex-display]:my-1 [&_.katex-display]:overflow-x-auto [&_.katex-display]:max-w-full">
+                        <MathText>{o.text}</MathText>
+                      </span>
                     </div>
                   </button>
                 );
@@ -276,40 +382,52 @@ export function MultipleChoiceMode({ deckId, cards, onComplete, onAnswered, part
           </div>
 
           {/* BACK */}
-          <div className="backface-hidden rotate-y-180 [grid-area:1/1] rounded-3xl border p-5 sm:p-8 flex flex-col bg-card glow-soft">
-            <div className="flex items-center gap-2">
+          <div className="backface-hidden rotate-y-180 [grid-area:1/1] flex flex-col rounded-2xl border border-border bg-card p-5 sm:p-8 shadow-sm">
+            <div className="flex items-center gap-2 text-xs font-semibold">
               {selected !== null && opts[selected]?.correct ? (
-                <span className="inline-flex items-center gap-1 rounded-full bg-success/20 text-success px-3 py-1 text-xs font-medium">
-                  <Check className="h-3.5 w-3.5" /> Correct
+                <span className="inline-flex items-center gap-1.5 text-success">
+                  <Check className="h-4 w-4" /> Correct
                 </span>
               ) : (
-                <span className="inline-flex items-center gap-1 rounded-full bg-destructive/20 text-destructive px-3 py-1 text-xs font-medium">
-                  <X className="h-3.5 w-3.5" /> Not quite
+                <span className="inline-flex items-center gap-1.5 text-destructive">
+                  <X className="h-4 w-4" /> Incorrect
                 </span>
               )}
             </div>
 
             <div className="mt-4">
-              <span className="text-xs uppercase tracking-wider text-muted-foreground font-mono">Your answer</span>
-              <p className="mt-1 text-sm text-foreground/80">{selected !== null ? <MathText>{opts[selected]?.text}</MathText> : "(none)"}</p>
+              <span className="font-mono text-xs uppercase tracking-wider text-muted-foreground">
+                Your answer
+              </span>
+              <p className="mt-1 text-sm text-foreground">
+                {selected !== null ? <MathText>{opts[selected]?.text}</MathText> : "(none)"}
+              </p>
             </div>
 
             <div className="mt-4">
-              <span className="text-xs uppercase tracking-wider text-primary font-mono">Correct answer</span>
-              <p className="mt-1 font-display text-lg font-semibold"><MathText>{q.answer}</MathText></p>
+              <span className="font-mono text-xs uppercase tracking-wider text-primary">
+                Correct answer
+              </span>
+              <p className="mt-1 font-display text-lg font-semibold text-foreground">
+                <MathText>{q.answer}</MathText>
+              </p>
               <Diagram svg={q.diagram} />
             </div>
 
-
             {q.explanation && (
               <div className="mt-5">
-                <span className="text-xs uppercase tracking-wider text-muted-foreground font-mono">Explanation</span>
-                <p className="mt-1 text-sm leading-relaxed text-muted-foreground"><MathText>{q.explanation}</MathText></p>
+                <span className="font-mono text-xs uppercase tracking-wider text-muted-foreground">
+                  Explanation
+                </span>
+                <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+                  <MathText>{q.explanation}</MathText>
+                </p>
               </div>
             )}
 
-            <Button onClick={next} className="mt-auto" size="lg">
-              {idx === quiz.length - 1 ? "Finish quiz" : "Next question"} <ChevronRight className="h-4 w-4 ml-1" />
+            <Button onClick={next} className="mt-auto pt-4" size="lg">
+              {idx === quiz.length - 1 ? "Finish quiz" : "Next question"}{" "}
+              <ChevronRight className="h-4 w-4 ml-1" />
             </Button>
           </div>
         </div>
