@@ -1,0 +1,570 @@
+import { GoogleGenAI, ThinkingLevel, Type, type Schema } from "@google/genai";
+import { createServerFn } from "@tanstack/react-start";
+import { z } from "zod";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { validateGeneratedCards } from "@/lib/question-types";
+
+const inputSchema = z.object({
+  text: z.string().max(200_000).optional(),
+  imageBase64: z.string().max(10_000_000).optional(),
+  imageMimeType: z.string().max(64).optional(),
+  hint: z.string().max(2000).optional(),
+  targetCards: z.number().int().min(5).max(2000).optional(),
+  exactCount: z.boolean().optional(),
+});
+
+function stripJsonFences(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+}
+
+// Parses the AI's card JSON; if the reply was cut off, keeps every card that finished.
+function parseToolArgs(raw: string): any {
+  const cleaned = stripJsonFences(raw);
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    /* salvage below */
+  }
+  const start = cleaned.indexOf("[", cleaned.indexOf('"cards"'));
+  const cards: any[] = [];
+  if (start >= 0) {
+    let depth = 0,
+      from = -1,
+      inStr = false,
+      esc = false;
+    for (let i = start + 1; i < cleaned.length; i++) {
+      const ch = cleaned[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === "\\") esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === "{") {
+        if (depth++ === 0) from = i;
+      } else if (ch === "}" && --depth === 0 && from >= 0) {
+        try {
+          cards.push(JSON.parse(cleaned.slice(from, i + 1)));
+        } catch {
+          /* skip incomplete card */
+        }
+        from = -1;
+      }
+    }
+  }
+  const title = cleaned.match(/"suggested_title"\s*:\s*"([^"]*)"/)?.[1];
+  const subject = cleaned.match(/"suggested_subject"\s*:\s*"([^"]*)"/)?.[1];
+  if (!cards.length) throw new Error("AI returned no cards");
+  return { suggested_title: title, suggested_subject: subject, cards };
+}
+
+function toGeminiSchema(node: any): Schema {
+  const typeMap: Record<string, Type> = {
+    object: Type.OBJECT,
+    array: Type.ARRAY,
+    string: Type.STRING,
+    number: Type.NUMBER,
+    integer: Type.INTEGER,
+    boolean: Type.BOOLEAN,
+  };
+  const out: any = {};
+  if (typeof node.type === "string" && typeMap[node.type.toLowerCase()]) {
+    out.type = typeMap[node.type.toLowerCase()];
+  }
+  if (typeof node.description === "string") out.description = node.description;
+  if (Array.isArray(node.enum)) out.enum = node.enum;
+  if (Array.isArray(node.required)) out.required = node.required;
+  if (node.items) out.items = toGeminiSchema(node.items);
+  if (node.properties && typeof node.properties === "object") {
+    out.properties = {};
+    for (const [k, v] of Object.entries(node.properties)) {
+      out.properties[k] = toGeminiSchema(v);
+    }
+  }
+  return out as Schema;
+}
+
+const GEMINI_MODELS = ["gemini-4-hydrogen", "gemini-3.1-flash-lite"] as const;
+const modelCooldown = new Map<string, number>();
+
+function parseGeminiErrorStatus(err: unknown): { status: number; message: string } {
+  const raw = err instanceof Error ? err.message : String(err);
+  const statusMatch = raw.match(/\b(400|401|403|404|429|500|502|503|504)\b/);
+  const status = (err as { status?: number })?.status ?? (statusMatch ? Number(statusMatch[1]) : 500);
+  return { status, message: raw };
+}
+
+// Calls the AI: prefers the app's own Google Gemini key (GEMINI_API_KEY / GOOGLE_API_KEY)
+// via @google/genai SDK, falling back to LOVABLE_API_KEY only when unset.
+async function callChat(body: any): Promise<any> {
+  const geminiKey = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "").trim();
+  if (geminiKey) {
+    const ai = new GoogleGenAI({
+      apiKey: geminiKey,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    });
+
+    const systemMsg = body.messages?.find((m: any) => m.role === "system");
+    const contents = (body.messages ?? [])
+      .filter((m: any) => m.role !== "system")
+      .map((m: any) => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: (Array.isArray(m.content) ? m.content : [{ type: "text", text: String(m.content) }]).map((p: any) => {
+          if (p.type === "image_url") {
+            const match = String(p.image_url?.url ?? "").match(/^data:(.*?);base64,(.*)$/);
+            return match ? { inlineData: { mimeType: match[1], data: match[2] } } : { text: "" };
+          }
+          return { text: p.text ?? "" };
+        }),
+      }));
+
+    const fn = body.tools?.[0]?.function;
+    const responseSchema = fn?.parameters ? toGeminiSchema(fn.parameters) : undefined;
+    const useJson = Boolean(responseSchema || body.response_format?.type === "json_object");
+
+    let lastStatus = 0;
+    let lastMsg = "";
+
+    for (const model of GEMINI_MODELS) {
+      const cooldown = modelCooldown.get(model);
+      if (cooldown && cooldown > Date.now()) continue;
+
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: contents.length === 1 ? { parts: contents[0].parts } : contents,
+          config: {
+            ...(systemMsg ? { systemInstruction: String(systemMsg.content) } : {}),
+            ...(useJson ? { responseMimeType: "application/json" } : {}),
+            ...(responseSchema ? { responseSchema } : {}),
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          },
+        });
+
+        const text = response.text ?? "";
+        if (!text.trim()) {
+          lastStatus = 502;
+          lastMsg = "Model returned an empty response";
+          continue;
+        }
+
+        if (fn) {
+          return {
+            choices: [
+              {
+                message: {
+                  content: text,
+                  tool_calls: [{ function: { name: fn.name, arguments: text } }],
+                },
+              },
+            ],
+          };
+        }
+        return { choices: [{ message: { content: text } }] };
+      } catch (err) {
+        const { status, message } = parseGeminiErrorStatus(err);
+        lastStatus = status;
+        lastMsg = message;
+        console.warn("Gemini error", model, status, message.slice(0, 240));
+
+        if (status === 403 || (status === 400 && /API_KEY_INVALID|API key not valid|PERMISSION_DENIED/i.test(message))) {
+          throw new Error("Gemini API key is invalid or missing permissions. Please check GEMINI_API_KEY in Settings > Secrets.");
+        }
+
+        const daily = status === 429 && /per ?day|PerDay/i.test(message);
+        modelCooldown.set(
+          model,
+          Date.now() + (daily ? 60 * 60_000 : status === 429 || status >= 500 ? 30_000 : 5 * 60_000),
+        );
+      }
+    }
+
+    console.error("All Gemini models failed", lastStatus, lastMsg.slice(0, 300));
+    if (lastStatus === 429) {
+      throw new Error("Gemini rate limit reached — please wait a moment or check your quota in Settings > Secrets.");
+    }
+    throw new Error(lastMsg ? `AI generation failed: ${lastMsg.slice(0, 140)}` : "The AI service is busy — please try again.");
+  }
+
+  const apiKey = (process.env.LOVABLE_API_KEY || "").trim();
+  if (!apiKey) {
+    throw new Error("AI is not configured. Add GEMINI_API_KEY in Settings > Secrets.");
+  }
+
+  const res = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 429) throw new Error("Rate limit reached. Please try again in a moment.");
+  if (res.status === 402) throw new Error("AI credits exhausted. Please add credits in workspace settings.");
+  if (!res.ok) {
+    const t = await res.text();
+    console.error("AI error", res.status, t);
+    throw new Error(res.status >= 500 ? "The AI service is busy — retrying with smaller pieces." : `AI generation failed (${res.status})`);
+  }
+  return res.json();
+}
+
+export const generateFlashcards = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) => inputSchema.parse(d))
+  .handler(async ({ data }) => {
+    const userContent: any[] = [];
+    if (data.text) userContent.push({ type: "text", text: `Source material:\n\n${data.text}` });
+    if (data.imageBase64 && data.imageMimeType) {
+      userContent.push({ type: "image_url", image_url: { url: `data:${data.imageMimeType};base64,${data.imageBase64}` } });
+    }
+    if (data.hint) userContent.push({ type: "text", text: `Additional context: ${data.hint}` });
+    if (typeof data.targetCards === "number") {
+      if (data.exactCount) {
+        userContent.push({ type: "text", text: `CRITICAL: This source is a question paper containing EXACTLY ${data.targetCards} questions. You MUST generate ONE flashcard for EVERY SINGLE question in the paper — do not skip, merge, or summarise any question. Preserve the original question numbering order. Return exactly ${data.targetCards} cards.` });
+      } else {
+        userContent.push({ type: "text", text: `IMPORTANT: Generate approximately ${data.targetCards} flashcards from this material (±10%). Cover every distinct concept — do not leave any topic out.` });
+      }
+    }
+    if (userContent.length === 0) throw new Error("Provide text or an image");
+
+    const system = `You are an expert university tutor that turns study material into high-quality, EXAM-GRADE flashcards.
+
+CONTENT FILTER — READ FIRST (mandatory):
+Before writing anything, silently classify every part of the source as either ADMINISTRATIVE/METADATA or ACADEMIC CONTENT, and then generate questions ONLY from the ACADEMIC CONTENT.
+- ADMINISTRATIVE/METADATA (NEVER turn into a question, never ask "who", "when", "how many marks" about it): university / faculty / department names, course codes and course titles, examiner / moderator / lecturer / invigilator names, exam dates, duration, venue, session, student number fields, exam or section instructions ("Answer any three questions", "Write in ink", "Calculators allowed", "Turn over"), marks allocation ("[10 marks]"), question numbering, page numbers, headers, footers, copyright lines, submission or answer-sheet instructions, plagiarism declarations, table-of-contents entries.
+- ACADEMIC CONTENT: definitions, concepts, theories, principles, formulas, derivations, worked calculations, examples, case studies, comparisons, causes/effects, processes, classifications, relationships and data that test real knowledge.
+- If the source is a past examination paper: first separate the examination instructions from the ACTUAL EXAMINABLE QUESTIONS, then build cards only from those examinable questions and their subject matter. Never treat an instruction as learning content.
+- Strip marks annotations, numbering and instruction fragments out of the question text you output — keep only the academic question itself.
+- If a section contains nothing but administrative material, return no cards for it rather than inventing questions about it.
+
+Rules:
+- Extract every distinct ACADEMIC question in the source. If answers are present, use them; otherwise generate accurate answers from your knowledge.
+
+- Each card MUST have: question, concise answer, a 3-5 sentence explanation that TEACHES the concept, a topic tag (use the actual topic / chapter name from the source if it has "Topic 1", "Topic 2", "Chapter X" etc — preserve that exact label), a difficulty (Easy, Medium, or Hard), a questionType, and EXACTLY 3 distractors.
+- QUESTION TYPE — mandatory and explicit. Set "questionType" to exactly one of: multiple_choice, true_false, short_answer, numerical, essay. Never leave it out.
+  * multiple_choice: you MUST also return an "options" array of EXACTLY 4 non-empty options, and the "answer" MUST be character-for-character identical to one of those options.
+  * If the question wording is "Which of the following…", "Which one of these…", "All of the following except…", "Which statement is correct…" or similar, it MUST be multiple_choice WITH options. If you cannot produce real options from the source, REWRITE the question as a direct short_answer question instead — never leave that wording without options.
+  * true_false: the answer MUST be exactly "True" or "False". Do not return options.
+  * numerical: the answer is a number (with units if relevant) — short factual computation.
+  * essay: long-form answer; the explanation must contain the marking points / model answer.
+  * short_answer: everything else; the answer is a concise sentence or phrase.
+- DISTRACTORS — this is critical for exam quality:
+  * Each distractor MUST be plausible and based on a COMMON STUDENT MISCONCEPTION, a near-miss calculation, or a closely-related-but-wrong concept on the same topic.
+  * Distractors MUST be similar in length, tone, formatting and level of detail to the correct answer (within ±25% character length). Never make the correct answer noticeably longer, more detailed, or more "textbook-sounding" than the distractors.
+  * Do NOT use generic fillers like "None of the above", "All of the above", "Not sure".
+  * For MATH: distractors are wrong final numerical/symbolic results from realistic mistakes (sign error, off-by-one, swapped formula, missing factor). Format them the same way as the correct answer (same LaTeX, same units).
+- MATH & SCIENCE: when the topic involves mathematics, physics, chemistry, statistics, economics, engineering or any formulas, ALWAYS write equations, variables, fractions, integrals, matrices, units and Greek letters using LaTeX. Use $...$ for inline math and $$...$$ for displayed equations. Never write math as plain text like "x^2" or "1/2".
+- For math/word problems, the explanation MUST show a clear step-by-step worked solution, each numbered step on its own line, with the final answer highlighted. Include the question RESTATED, the formula(s) used, substitutions, and the answer with units.
+- DIAGRAMS: when a visual would clarify the question or answer (geometry, triangles, circles, graphs of functions, force/free-body diagrams, circuits, biology anatomy, chemistry molecules/reactions, flowcharts, number lines, bar/pie charts, coordinate plots), include a clear inline SVG in the "diagram" field. Otherwise OMIT the field.
+  * SVG rules: self-contained <svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">…</svg>. No <script>, no external images, no <foreignObject>. Use stroke="currentColor" / fill="currentColor" (or explicit web-safe colours) so it works on dark backgrounds. Use <text> for labels. Keep it crisp and clean — illustrative, not decorative.
+  * If the source document already references a figure (e.g. "see Fig 2.3"), recreate the essential diagram so the student can answer without the original.
+- TOPIC GROUPING: if the source clearly splits into multiple topics/chapters/parts (e.g. "Topic 1: Limits", "Topic 2: Derivatives"), tag each card with the exact topic label so students can practise one topic at a time.
+- If the source is not a list of questions, create comprehensive flashcards that cover every important concept.
+- CARD COUNT — scale to the source. Small source (≤500 words): 8-15 cards. Medium (500-3000 words): 20-40 cards. Large (3000-15000 words / multi-topic / textbook chapter / past paper bundle): 50-100 cards, covering EVERY topic and sub-topic — do not leave material out. Never return fewer than 8. Be thorough but avoid near-duplicates.`;
+
+    const body = {
+      model: "google/gemini-2.5-flash",
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: userContent },
+      ],
+      tools: [{
+        type: "function",
+        function: {
+          name: "save_flashcards",
+          description: "Save the generated flashcards",
+          parameters: {
+            type: "object",
+            properties: {
+              suggested_title: { type: "string" },
+              suggested_subject: { type: "string" },
+              cards: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    question: { type: "string" },
+                    answer: { type: "string" },
+                    explanation: { type: "string" },
+                    topic: { type: "string" },
+                    difficulty: { type: "string", enum: ["Easy", "Medium", "Hard"] },
+                    questionType: { type: "string", enum: ["multiple_choice", "true_false", "short_answer", "numerical", "essay"] },
+                    options: { type: "array", items: { type: "string" }, description: "Exactly 4 options — REQUIRED when questionType is multiple_choice. The answer must be one of them. Omit for other types." },
+                    distractors: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 3 },
+                    diagram: { type: "string", description: "Optional inline SVG diagram. Omit if not needed." },
+                  },
+                  required: ["question", "answer", "explanation", "topic", "difficulty", "questionType", "distractors"],
+                  additionalProperties: false,
+                },
+              },
+            },
+            required: ["suggested_title", "suggested_subject", "cards"],
+            additionalProperties: false,
+          },
+        },
+      }],
+      tool_choice: { type: "function", function: { name: "save_flashcards" } },
+    };
+
+    const json = await callChat(body);
+    const toolCall = json.choices?.[0]?.message?.tool_calls?.[0];
+    const rawArgs = toolCall?.function?.arguments ?? json.choices?.[0]?.message?.content;
+    if (!rawArgs) throw new Error("AI returned no cards");
+    const parsed = parseToolArgs(rawArgs);
+    const validated = validateGeneratedCards(parsed?.cards ?? []);
+    if (!validated.length) throw new Error("AI returned no valid flashcards for this material.");
+    return {
+      suggested_title: String(parsed?.suggested_title ?? "Untitled deck"),
+      suggested_subject: String(parsed?.suggested_subject ?? ""),
+      cards: validated,
+    };
+  });
+
+// Stage 0 — split raw document text into administrative metadata vs academic content.
+export const classifyDocument = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) => z.object({ text: z.string().min(1).max(200_000) }).parse(d))
+  .handler(async ({ data }) => {
+    const system = `You are a document structuring engine. Split the given document extract into two parts and return them as JSON.
+
+ADMINISTRATIVE INFORMATION (metadata — never study material): university / faculty / department, course code and title, examiner / moderator / lecturer / invigilator names, exam date, duration, venue, session, student-number fields, exam and section instructions ("Answer any three questions", "Calculators permitted", "Turn over"), marks allocation, question numbering, page numbers, headers, footers, copyright, plagiarism declarations, submission/answer-sheet instructions, table of contents.
+
+ACADEMIC CONTENT: everything that carries real subject knowledge — the actual examinable questions, definitions, concepts, theories, principles, formulas, derivations, worked examples, data, cases, tables and figures with meaning.
+
+Rules:
+- Reproduce the ACADEMIC CONTENT VERBATIM and IN FULL. Never summarise, shorten, reorder or omit any academic sentence, question or sub-question — completeness matters more than tidiness.
+- Remove marks annotations, page numbers, running headers/footers and instruction lines from the academic text, but keep the questions themselves intact.
+- Keep the topic/chapter/section headings that describe subject matter (e.g. "Topic 2: Derivatives") inside the academic content.
+- If the extract is entirely administrative, return an empty academic_content string.`;
+
+    const json = await callChat({
+      model: "google/gemini-2.5-flash",
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: data.text },
+      ],
+      tools: [{
+        type: "function",
+        function: {
+          name: "save_structure",
+          parameters: {
+            type: "object",
+            properties: {
+              administrative: {
+                type: "object",
+                properties: {
+                  course_code: { type: "string" },
+                  course_title: { type: "string" },
+                  examiner: { type: "string" },
+                  exam_instructions: { type: "array", items: { type: "string" } },
+                  section_instructions: { type: "array", items: { type: "string" } },
+                },
+                additionalProperties: false,
+              },
+              academic_content: { type: "string" },
+              topics: { type: "array", items: { type: "string" } },
+              is_exam_paper: { type: "boolean" },
+            },
+            required: ["academic_content", "topics"],
+            additionalProperties: false,
+          },
+        },
+      }],
+      tool_choice: { type: "function", function: { name: "save_structure" } },
+    });
+    const tc = json.choices?.[0]?.message?.tool_calls?.[0];
+    const raw = tc?.function?.arguments ?? json.choices?.[0]?.message?.content;
+    if (!raw) throw new Error("Document analysis returned nothing");
+    const parsed = JSON.parse(stripJsonFences(raw));
+    return {
+      academicContent: String(parsed?.academic_content ?? ""),
+      topics: Array.isArray(parsed?.topics) ? parsed.topics.map((t: unknown) => String(t)).slice(0, 60) : [],
+      isExamPaper: Boolean(parsed?.is_exam_paper),
+      administrative: parsed?.administrative ?? {},
+    };
+  });
+
+// Generate a quiz from existing cards (turns answers into MCQs with distractors)
+export const generateQuiz = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) => z.object({
+    cards: z.array(z.object({ question: z.string(), answer: z.string() })).min(1).max(50),
+  }).parse(d))
+  .handler(async ({ data }) => {
+    const body = {
+      model: "google/gemini-2.5-flash",
+      messages: [
+        { role: "system", content: "Turn flashcards into a multiple-choice quiz. For each card, write 3 plausible but incorrect distractor options. Keep the correct answer concise." },
+        { role: "user", content: JSON.stringify(data.cards) },
+      ],
+      tools: [{
+        type: "function",
+        function: {
+          name: "save_quiz",
+          parameters: {
+            type: "object",
+            properties: {
+              questions: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    question: { type: "string" },
+                    correct: { type: "string" },
+                    distractors: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 3 },
+                  },
+                  required: ["question", "correct", "distractors"],
+                  additionalProperties: false,
+                },
+              },
+            },
+            required: ["questions"],
+            additionalProperties: false,
+          },
+        },
+      }],
+      tool_choice: { type: "function", function: { name: "save_quiz" } },
+    };
+
+    const json = await callChat(body);
+    const tc = json.choices?.[0]?.message?.tool_calls?.[0];
+    const raw = tc?.function?.arguments ?? json.choices?.[0]?.message?.content;
+    if (!raw) throw new Error("No quiz returned");
+    return JSON.parse(stripJsonFences(raw)) as {
+      questions: { question: string; correct: string; distractors: string[] }[];
+    };
+  });
+
+// Grade open-ended answers leniently with partial credit (out of 5 per question based on complexity)
+export const gradeOpenAnswers = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) => z.object({
+    items: z.array(z.object({
+      question: z.string(),
+      expected: z.string(),
+      userAnswer: z.string(),
+    })).min(1).max(50),
+  }).parse(d))
+  .handler(async ({ data }) => {
+    const system = `You are a fair but HONEST university examiner. Grade each student answer out of a max of 5 marks. Your job is to detect wrong answers accurately — do NOT reward effort with marks the answer didn't earn.
+
+Rules:
+- Decide max_marks per question based on the depth/complexity required by the expected answer: short factual recall = 1, short explanation = 2, multi-part = 3, detailed explanation = 4, comprehensive long-form = 5.
+- Award 0 marks when the student's answer is blank, gibberish, random letters, "idk"/"?"/"-", unrelated to the question, contradicts the expected answer, names the wrong entity/number/formula, or has the wrong sign.
+- Award full max_marks ONLY when the student's answer conveys the same key facts / same final result as the expected answer (synonyms and paraphrasing are fine).
+- Award PARTIAL marks (between 0 and max_marks) only when the student clearly demonstrates SOME correct knowledge from the expected answer — a correct step, a correct sub-part, a right formula with a wrong final number, etc. Do NOT give partial marks for merely mentioning the topic or writing something that "sounds academic".
+- For MATH, treat equivalent forms as equal (e.g. "1/2" = "0.5" = "$\\tfrac{1}{2}$"). Award partial marks for correct method with a wrong final number.
+- Never default to a positive score when uncertain — default to 0 and explain what was missing.
+- Keep feedback to one short, honest sentence (supportive tone, but state clearly what was wrong or missing). You may use LaTeX ($...$) in feedback when referring to formulas.`;
+
+    const body = {
+      model: "google/gemini-2.5-flash",
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: JSON.stringify(data.items) },
+      ],
+      tools: [{
+        type: "function",
+        function: {
+          name: "save_grades",
+          parameters: {
+            type: "object",
+            properties: {
+              grades: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    score: { type: "number" },
+                    max_marks: { type: "number" },
+                    feedback: { type: "string" },
+                  },
+                  required: ["score", "max_marks", "feedback"],
+                  additionalProperties: false,
+                },
+              },
+            },
+            required: ["grades"],
+            additionalProperties: false,
+          },
+        },
+      }],
+      tool_choice: { type: "function", function: { name: "save_grades" } },
+    };
+
+    const json = await callChat(body);
+    const tc = json.choices?.[0]?.message?.tool_calls?.[0];
+    const raw = tc?.function?.arguments ?? json.choices?.[0]?.message?.content;
+    if (!raw) throw new Error("No grades returned");
+    const parsed = JSON.parse(stripJsonFences(raw)) as {
+      grades: { score: number; max_marks: number; feedback: string }[];
+    };
+    return {
+      grades: (parsed.grades ?? []).map((g) => {
+        const max = Math.max(1, Math.round(Number(g.max_marks) || 1));
+        const score = Math.max(0, Math.min(max, Number(g.score) || 0));
+        return { score, max_marks: max, feedback: String(g.feedback ?? "") };
+      }),
+    };
+  });
+
+// Judge a single typed answer semantically (synonyms, paraphrasing, partial credit)
+export const judgeAnswer = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) => z.object({
+    question: z.string().min(1).max(4000),
+    correctAnswer: z.string().min(1).max(4000),
+    userAnswer: z.string().max(4000),
+  }).parse(d))
+  .handler(async ({ data }) => {
+    const userAns = (data.userAnswer ?? "").trim();
+    if (userAns.length === 0 || /^(idk|i don'?t know|n\/?a|\?+|\.+|-+)$/i.test(userAns)) {
+      return { correct: false, feedback: "You didn't provide an answer. Review the correct answer below." };
+    }
+
+    const prompt = `QUESTION: ${data.question}
+CORRECT ANSWER: ${data.correctAnswer}
+STUDENT ANSWER: ${userAns}
+
+Compare the STUDENT ANSWER strictly against the CORRECT ANSWER. Reply with only a JSON object: { "correct": true|false, "feedback": "one short sentence" }`;
+
+    const json = await callChat({
+      model: "google/gemini-2.5-flash",
+      messages: [
+        { role: "system", content: `You are a STRICT but fair flashcard grader. Your job is to detect wrong answers, not to reward effort.
+
+Mark "correct": true ONLY when the student answer conveys the SAME core meaning / same final result as the correct answer. Synonyms, paraphrasing, and different word order are fine. For MATH, equivalent numerical/symbolic forms are equal (1/2 = 0.5 = \\tfrac{1}{2}).
+
+Mark "correct": false when ANY of these are true:
+- The answer is empty, gibberish, random letters, or unrelated to the question.
+- The answer contradicts the correct answer, names the wrong entity/number/formula, or has the wrong sign.
+- The answer is only tangentially related (mentions the topic but does not actually answer the question).
+- The answer is missing the key fact / final result the correct answer states.
+- The student wrote "I don't know", "idk", "?", "-", or similar.
+
+A partial answer that captures the main required fact = correct. A partial answer that misses the main required fact = incorrect. Never default to correct when unsure — default to incorrect and explain what was missing.
+
+Respond ONLY with the JSON object requested — no markdown, no prose.` },
+        { role: "user", content: prompt },
+      ],
+      response_format: { type: "json_object" },
+    });
+    const raw: string = json.choices?.[0]?.message?.content ?? "";
+    const cleaned = stripJsonFences(raw);
+    try {
+      const parsed = JSON.parse(cleaned);
+      return {
+        correct: Boolean(parsed.correct),
+        feedback: typeof parsed.feedback === "string" ? parsed.feedback : "",
+      };
+    } catch {
+      throw new Error("Could not parse grader response");
+    }
+  });
